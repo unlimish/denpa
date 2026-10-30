@@ -24,6 +24,7 @@ import {
   storeResponse,
   videos,
 } from "./offline-db";
+import { offlineSource } from "./offline-source";
 import type { PlayAxis } from "./ts/playback";
 
 /** 画面に映すぶんだけ。blob はここに持たない (要るときに IndexedDB から) */
@@ -249,6 +250,7 @@ interface SaveTarget {
   start_at: number;
   duration_ms: number | null;
   ts_size: number;
+  library_path: string | null;
   alt_path: string | null;
 }
 
@@ -292,16 +294,16 @@ async function probeDownloads(
 }
 
 /**
- * 端末に保存する。**どちらを落とすかはここで決める** — 既定は AV1、
- * 端末がデコードできなければ H.264 (両方エンコードした録画だけ)。
+ * 端末に保存する。**どちらを落とすかはここで決める** (`offline-source.ts`) — 主が AV1 なら
+ * 端末がデコードできるときだけ主、できなければ H.264 (両方エンコードした録画だけ)。
+ * 主が H.264 (H.264 だけ焼いた録画) ならそのまま主
  */
 export async function saveOffline(rec: SaveTarget): Promise<void> {
-  let source: "encoded" | "alt" = "encoded";
-  if (!(await canPlayAv1())) {
-    if (rec.alt_path === null)
-      throw new Error("AV1 を再生できず、H.264 のものもありません");
-    source = "alt";
-  }
+  const source = await offlineSource(
+    rec.library_path,
+    rec.alt_path,
+    canPlayAv1,
+  );
 
   // 下見して、在るものだけに絞る (404 が混ざると全体が失敗になる)
   const { urls, total } = await probeDownloads(

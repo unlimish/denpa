@@ -77,10 +77,14 @@ DB 名 `denpa-offline`、ストア3つ (実体は [offline-db.ts](../src/lib/off
 
 ### どちらを保存するか — 端末がデコードできるコーデック
 
-**既定は AV1** (`library_path`)。端末が AV1 をデコードできなければ H.264 (`alt_path`) を保存する。
-判定は `navigator.mediaCapabilities.decodingInfo()` (`video/mp4; codecs=av01.…` の
-`supported`)。H.264 しかデコードできない端末で `alt_path` が無い録画は、ダウンロード時に
-「この端末では再生できない」と断る (保存できても観られないため)。
+**主 (`library_path`) が何で焼かれているかを先に見る** (名前の `[H264]`。`src/lib/offline-source.ts`)。
+H.264 だけ焼いた録画は主が H.264 なので、そのまま主を保存する (どの端末でも解ける)。
+
+主が AV1 なら、端末が AV1 をデコードできるときは主、できなければ H.264 (`alt_path`) を保存する。
+判定は `navigator.mediaCapabilities.decodingInfo()` (`video/mp4; codecs=av01.0.09M.08` を
+1080p60 で問うた `supported`。**Level は 4.1** — 4.0 は 30fps までで、Safari は Level と
+コマ数を突き合わせて「解けない」と答える)。AV1 しか無い録画を AV1 を解けない端末で保存すると、
+「AV1 を再生できず、H.264 のものもありません」と断る (保存できても観られないため)。
 
 ### 観る
 

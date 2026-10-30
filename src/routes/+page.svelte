@@ -142,7 +142,8 @@
 
   /**
    * 端末に保存する ([docs/offline.md](../../docs/offline.md))。落とすものは
-   * `saveOffline` が決める (既定 AV1、端末がデコードできなければ H.264)。
+   * `saveOffline` が決める (主が AV1 なら端末がデコードできるときだけ主、できなければ H.264。
+   * 主が H.264 ならそのまま)。
    * Background Fetch ならタブを閉じても続くので、押したら詳細は閉じる
    */
   async function saveToDevice(rec: Rec): Promise<void> {
