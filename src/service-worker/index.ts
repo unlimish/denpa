@@ -43,6 +43,104 @@ const SHELL = [
  * install のたびに取り直す
  */
 const OFFLINE_PAGE = resolve("offline");
+/**
+ * 入口が始まるときに読むデータ (共通の枠の `+layout.server.ts`。ログインの控えなど)。
+ * **入口は SSR を切った殻なので、開くたびにこれをサーバへ取りに行く** — 控えていなかった頃は
+ * 電波が無いとここで転び、真っ白な画面になっていた。入口と一緒に控え、繋がらないときだけ出す。
+ * ログインの控えを含むので、ログアウトしたら消す (`forgetOfflineData`・`keepOfflineData`)
+ */
+const OFFLINE_DATA = `${OFFLINE_PAGE}/__data.json`;
+/**
+ * 音 (と MPEG-2) をデコードする WebAssembly (`routes/api/live/mpeg2`。`raw/worker.ts` が読む)。
+ * **入口で保存した録画を canvas に描くとき要る** — iPhone の Safari は保存した Matroska を `<video>` で
+ * 読めないので、入口は観る画面の互換モードと同じエンジンで描く (`offline/+page.svelte`)。
+ * `/api/` は素通しなので、控えていなかった頃は電波が無いと「音声を再生できません」で止まっていた。
+ * 中身はイメージごとに変わる (URL は同じ) ので、入口と同じく install のたびに取り直し、サーバ優先で出す
+ */
+const DECODER = ["decoder.mjs", "decoder.wasm"].map(
+  (file) => `${resolve("")}api/live/mpeg2/${file}`,
+);
+
+/**
+ * 画面と入口のデータをサーバへ取りに行く。**繋がっていないと分かっていれば待たず、返事が来なくて
+ * サーバにも繋がらなければ見切る。**
+ *
+ * iPhone の Safari は機内モードで、取りに行ったものが失敗せずに返事待ちのまま止まることがあり、
+ * 入口へ移れずにいつまでも読み込み中になっていた。電波の弱いところで繋がりかけのまま止まるのも同じ。
+ *
+ * - 端末が繋がっていないと言うなら取りに行かない
+ * - 10秒返事が無ければ、**軽い口 (`/api/health`) でサーバに繋がるか確かめる。** 返事があれば
+ *   サーバが重いだけ (エンコード中など) なので待ち続ける — 10秒で一律に見切っていた頃は、繋がっている人まで
+ *   入口へ移していた。そちらも返事が無ければ見切る
+ * - **見切った・失敗したら、しばらく (30秒) は取りに行かない。** 開いた画面 → 入口へ移る → 入口のデータ、と
+ *   続けて取りに行くので、毎回待たせない
+ */
+const NETWORK_WAIT = 10_000;
+const PROBE_WAIT = 3_000;
+const GIVE_UP_FOR = 30_000;
+const HEALTH = `${resolve("")}api/health`;
+let unreachableUntil = 0;
+
+function giveUp(): Error {
+  unreachableUntil = Date.now() + GIVE_UP_FOR;
+  return new Error("繋がっていません");
+}
+
+/** サーバに繋がるか。返事が来れば中身は問わない (ログイン切れの 401 でも繋がってはいる) */
+async function reachable(): Promise<boolean> {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), PROBE_WAIT);
+  try {
+    await fetch(HEALTH, { cache: "no-store", signal: abort.signal });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fromNetwork(request: Request): Promise<Response> {
+  if (!worker.navigator.onLine || Date.now() < unreachableUntil)
+    throw new Error("繋がっていません");
+  const pending = fetch(request).catch(() => {
+    throw giveUp();
+  });
+  // 見切ったあとに失敗しても、拾われていないと騒がせない
+  pending.catch(() => {});
+  const first = await Promise.race([
+    pending,
+    new Promise<null>((resolve) =>
+      setTimeout(() => resolve(null), NETWORK_WAIT),
+    ),
+  ]);
+  if (first !== null) return first;
+  if (await reachable()) return pending;
+  throw giveUp();
+}
+
+/**
+ * **入口のデータ (`OFFLINE_DATA`) はログインの控えを含む。** ログアウトしたら消し、サーバに断られたら
+ * (ほかの端末からログアウトされた・期限が切れた) 消す。取れたら新しいものに替える
+ */
+async function keepOfflineData(response: Response): Promise<void> {
+  const cache = await caches.open(CACHE);
+  if (response.ok) await cache.put(OFFLINE_DATA, response);
+  else if (response.status === 401 || response.status === 403)
+    await cache.delete(OFFLINE_DATA, { ignoreSearch: true });
+}
+
+async function forgetOfflineData(): Promise<void> {
+  await (await caches.open(CACHE)).delete(OFFLINE_DATA, { ignoreSearch: true });
+}
+
+/** 画面を開けた (ログインしている) のに入口のデータが無ければ取っておく (ログインし直したあと) */
+async function refillOfflineData(): Promise<void> {
+  const cache = await caches.open(CACHE);
+  if ((await cache.match(OFFLINE_DATA, { ignoreSearch: true })) !== undefined)
+    return;
+  await cache.add(OFFLINE_DATA).catch(() => {});
+}
 
 worker.addEventListener("install", (event) => {
   event.waitUntil(
@@ -50,6 +148,9 @@ worker.addEventListener("install", (event) => {
       await cache.addAll(SHELL);
       // 入口は無くても殻は使える。デプロイした直後などで取れなくても諦める
       await cache.add(OFFLINE_PAGE).catch(() => {});
+      await cache.add(OFFLINE_DATA).catch(() => {});
+      // 組んでいない denpa もある (無ければ 404)。入口で描けないだけなので諦める
+      await Promise.all(DECODER.map((url) => cache.add(url).catch(() => {})));
     }),
   );
   void worker.skipWaiting();
@@ -71,12 +172,27 @@ worker.addEventListener("activate", (event) => {
 
 worker.addEventListener("fetch", (event) => {
   const { request } = event;
-  if (request.method !== "GET") return;
-
   const url = new URL(request.url);
   if (url.origin !== location.origin) return;
+  // ログアウト (POST `/logout`)。ログインの控えを含む入口のデータを残さない。送るのはそのまま
+  if (url.pathname === `${resolve("")}logout`) {
+    event.waitUntil(forgetOfflineData());
+    return;
+  }
+  if (request.method !== "GET") return;
+  // デコーダはサーバ優先、繋がらなければ控え (`DECODER`)
+  if (DECODER.includes(url.pathname)) {
+    event.respondWith(
+      fromNetwork(request).catch(
+        async () =>
+          (await caches.match(url.pathname, { ignoreVary: true })) ??
+          Response.error(),
+      ),
+    );
+    return;
+  }
   /*
-   * API は素通しする。録画の配信は数十GB、通知は繋ぎっぱなしの SSE で、
+   * ほかの API は素通しする。録画の配信は数十GB、通知は繋ぎっぱなしの SSE で、
    * どちらもキャッシュに載せると壊れる
    */
   if (url.pathname.startsWith(`${resolve("")}api/`)) return;
@@ -88,10 +204,41 @@ worker.addEventListener("fetch", (event) => {
    */
   if (request.mode === "navigate") {
     event.respondWith(
-      fetch(request).catch(async () => {
-        const fallback = await caches.match(OFFLINE_PAGE);
-        return fallback ?? Response.error();
-      }),
+      fromNetwork(request).then(
+        (response) => {
+          // 開けた (ログイン画面へ回されていない)。ログインし直したあとなら入口のデータを取り直す
+          if (response.ok && !response.redirected)
+            event.waitUntil(refillOfflineData());
+          return response;
+        },
+        async () => {
+          const page = await caches.match(OFFLINE_PAGE);
+          if (page === undefined) return Response.error();
+          /*
+           * **入口へ移す** (その場で入口の HTML を返さない)。殻は開いた URL の画面として
+           * 始まるので、`/` のまま返すと一覧の画面を組もうとしてデータを取りに行き、転んでいた
+           */
+          if (url.pathname !== OFFLINE_PAGE)
+            return Response.redirect(new URL(OFFLINE_PAGE, location.origin));
+          return page;
+        },
+      ),
+    );
+    return;
+  }
+
+  // 入口のデータはサーバ優先 (ログインの控えが変わる)。繋がらなければ控え
+  if (url.pathname === OFFLINE_DATA) {
+    event.respondWith(
+      fromNetwork(request).then(
+        (response) => {
+          event.waitUntil(keepOfflineData(response.clone()));
+          return response;
+        },
+        async () =>
+          (await caches.match(OFFLINE_DATA, { ignoreSearch: true })) ??
+          Response.error(),
+      ),
     );
     return;
   }
